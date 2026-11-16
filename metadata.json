@@ -1,0 +1,6 @@
+{
+  "name": "Rumbo",
+  "description": "Aplicación de desarrollo personal para organizar metas, hábitos, clima interior, cuaderno, rueda de vida, biblioteca y guía con IA.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
