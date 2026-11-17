@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Ico } from "./components/Icons";
+import { OfflineIndicator } from "./components/PWAPrompts";
 import { TD } from "./data/rumboData";
 import type {
   Course,
@@ -942,6 +943,7 @@ export default function App() {
   return (
     <>
       <main id="m">{renderMainContent()}</main>
+      <OfflineIndicator />
 
       {!hideBottomNav && (
         <nav className="rumbo-nav">

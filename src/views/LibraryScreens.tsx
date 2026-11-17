@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Ico } from "../components/Icons";
+import { PWAInstallButton } from "../components/PWAPrompts";
 import { REF, SZ, T, TD } from "../data/rumboData";
 import type {
   Course,
@@ -1020,6 +1021,9 @@ export const ProfileView: React.FC<{
             ? `IA activa en el servidor (${aiModel}). Guía personal, las metas con IA y el generador de recursos funcionan automáticamente.`
             : "Sin IA conectada: Guía personal y el generador de planes usan respuestas locales con tus datos."}
         </p>
+
+        <h3 style={{ marginTop: 16 }}>Instalar en el celular</h3>
+        <PWAInstallButton variant="profile" />
 
         <h3 style={{ marginTop: 16 }}>Respaldo de datos</h3>
         <p className="sub">

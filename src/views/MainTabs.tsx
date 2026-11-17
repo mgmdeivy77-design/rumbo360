@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { BarChart, LifeWheel, MoodChart, YearHeatmap } from "../components/Charts";
 import { GoalCard } from "../components/GoalCard";
 import { Ico } from "../components/Icons";
+import { PWAInstallButton } from "../components/PWAPrompts";
 import { D, DT, T, WK } from "../data/rumboData";
 import type { Course, RumboState } from "../types";
 import {
@@ -70,6 +71,8 @@ export const HomeView: React.FC<{
           </button>
         ))}
       </div>
+
+      <PWAInstallButton variant="banner" />
 
       {showWeeklyBanner && (
         <div className="card" style={{ borderColor: "var(--acc)", marginTop: 12 }}>
