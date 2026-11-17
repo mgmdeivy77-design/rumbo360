@@ -15,9 +15,17 @@ export class GenerationPausedError extends Error {
   }
 }
 
+class HttpAiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export async function checkAiStatus(): Promise<{ available: boolean; model?: string }> {
   try {
-    const res = await fetch("/api/ai/status");
+    const res = await fetch("/api/ai/status", { credentials: "same-origin" });
     if (!res.ok) return { available: false };
     return (await res.json()) as { available: boolean; model?: string };
   } catch {
@@ -34,6 +42,7 @@ async function postAiGenerate(
   try {
     res = await fetch("/api/ai/generate", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, json }),
       signal,
@@ -49,7 +58,10 @@ async function postAiGenerate(
 
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body?.message || `Error del servidor (${res.status}).`);
+    throw new HttpAiError(
+      body?.message || `Error del servidor (${res.status}).`,
+      res.status
+    );
   }
   return body as { text?: string; data?: unknown };
 }
@@ -80,6 +92,14 @@ async function jx<T = Record<string, unknown>>(
     } catch (e) {
       if (e instanceof GenerationPausedError || signal?.aborted) {
         throw new GenerationPausedError();
+      }
+      if (
+        e instanceof HttpAiError &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 429
+      ) {
+        throw e;
       }
       if (k >= tries) throw e;
       await new Promise<void>((resolve, reject) => {
