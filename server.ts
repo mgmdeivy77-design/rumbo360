@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { handleAiGenerate, handleAiStatus } from "./lib/aiServer.ts";
@@ -11,6 +12,7 @@ const PORT = Number(process.env.PORT) || 3000;
 
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
 
@@ -33,8 +35,14 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
+    const hmrDisabled = process.env.DISABLE_HMR === "true";
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        port: PORT,
+        hmr: hmrDisabled ? false : { server: httpServer },
+        ws: { server: httpServer },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -46,7 +54,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Rumbo server listening on http://localhost:${PORT}`);
   });
 }

@@ -734,8 +734,17 @@ export const RecGenView: React.FC<{
   const [sz, setSz] = useState(initialSize || "c");
   const [busy, setBusy] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
+  const [errorMsg, setErrorMsg] = useState("");
   const [progress, setProgress] = useState<{ i: number; n: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setTopic(initialTopic);
+  }, [initialTopic]);
+
+  useEffect(() => {
+    setSz(initialSize || "c");
+  }, [initialSize]);
 
   useEffect(() => {
     return () => {
@@ -752,6 +761,7 @@ export const RecGenView: React.FC<{
     const controller = new AbortController();
     abortRef.current = controller;
     setBusy(true);
+    setErrorMsg("");
 
     if (resumePending?.outline?.lessons?.length) {
       const done = resumePending.completedLessons?.length || 0;
@@ -773,9 +783,13 @@ export const RecGenView: React.FC<{
       const c = await generateAiCourse(effectiveTopic, effectiveSz, effectiveBase, {
         existingPending: resumePending,
         signal: controller.signal,
-        onProgress: (i, n) => {
+        onProgress: (i, n, batchEnd) => {
           setProgress({ i, n });
-          setStatusMsg(`Escribiendo la lección ${i} de ${n}…`);
+          if (batchEnd && batchEnd > i) {
+            setStatusMsg(`Escribiendo lecciones ${i}–${batchEnd} de ${n}…`);
+          } else {
+            setStatusMsg(`Escribiendo la lección ${i} de ${n}…`);
+          }
         },
         onCheckpoint: (cp) => {
           onSavePending(cp);
@@ -783,6 +797,7 @@ export const RecGenView: React.FC<{
       });
       onSavePending(null);
       setProgress(null);
+      setStatusMsg("");
       onCreated(c);
     } catch (e: unknown) {
       if (e instanceof GenerationPausedError) {
@@ -791,7 +806,8 @@ export const RecGenView: React.FC<{
         );
       } else {
         const err = e as { message?: string };
-        setStatusMsg(
+        setStatusMsg("");
+        setErrorMsg(
           err?.message || "No se pudo generar el recurso. Inténtalo de nuevo."
         );
       }
@@ -831,6 +847,7 @@ export const RecGenView: React.FC<{
             onClick={() => {
               onSavePending(null);
               setStatusMsg("");
+              setErrorMsg("");
               setProgress(null);
             }}
           >
@@ -876,7 +893,11 @@ export const RecGenView: React.FC<{
           disabled={busy}
           onClick={() => runGeneration(null)}
         >
-          {hasSavedProgress ? "Generar un recurso nuevo" : "Generar recurso"}
+          {busy
+            ? "Generando…"
+            : hasSavedProgress
+              ? "Generar un recurso nuevo"
+              : "Generar recurso"}
         </button>
 
         {busy && (
@@ -901,6 +922,19 @@ export const RecGenView: React.FC<{
         )}
 
         {statusMsg && <p className="sub">{statusMsg}</p>}
+        {errorMsg && (
+          <div
+            className="card"
+            style={{
+              marginTop: 10,
+              borderColor: "var(--bad)",
+              color: "var(--bad)",
+            }}
+          >
+            <b>No se pudo completar</b>
+            <p style={{ margin: "6px 0 0" }}>{errorMsg}</p>
+          </div>
+        )}
         <p className="sub">
           {aiAvailable
             ? "IA activa en el servidor."

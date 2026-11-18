@@ -33,28 +33,56 @@ export async function checkAiStatus(): Promise<{ available: boolean; model?: str
   }
 }
 
+const REQUEST_TIMEOUT_MS = 45_000;
+const LESSON_BATCH_SIZE = 3;
+
 async function postAiGenerate(
   prompt: string,
   json: boolean,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  fast = false
 ): Promise<{ text?: string; data?: unknown }> {
+  const timeoutCtrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    timeoutCtrl.abort();
+  }, REQUEST_TIMEOUT_MS);
+
+  const onParentAbort = () => timeoutCtrl.abort();
+  if (signal?.aborted) {
+    clearTimeout(timer);
+    throw new GenerationPausedError();
+  }
+  signal?.addEventListener("abort", onParentAbort, { once: true });
+
   let res: Response;
   try {
     res = await fetch("/api/ai/generate", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, json }),
-      signal,
+      body: JSON.stringify({ prompt, json, ...(fast ? { fast: true } : {}) }),
+      signal: timeoutCtrl.signal,
     });
   } catch (err: unknown) {
-    if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onParentAbort);
+    if (signal?.aborted) {
+      throw new GenerationPausedError();
+    }
+    if (timedOut) {
+      throw new Error("La solicitud tardó demasiado. Tu avance quedó guardado para continuar.");
+    }
+    if (err instanceof DOMException && err.name === "AbortError") {
       throw new GenerationPausedError();
     }
     throw new Error(
       "No se pudo conectar con el servidor de IA. Tu avance quedó guardado para continuar donde te quedaste."
     );
   }
+  clearTimeout(timer);
+  signal?.removeEventListener("abort", onParentAbort);
 
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -73,22 +101,24 @@ export async function aiAskText(prompt: string, signal?: AbortSignal): Promise<s
 
 export async function aiAskJson<T = Record<string, unknown>>(
   prompt: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  fast = false
 ): Promise<T> {
-  const body = await postAiGenerate(prompt, true, signal);
+  const body = await postAiGenerate(prompt, true, signal, fast);
   if (body?.data !== undefined) return body.data as T;
   return JSON.parse(String(body?.text || "{}")) as T;
 }
 
 async function jx<T = Record<string, unknown>>(
   prompt: string,
-  tries = 2,
-  signal?: AbortSignal
+  tries = 3,
+  signal?: AbortSignal,
+  fast = false
 ): Promise<T> {
   for (let k = 1; ; k++) {
     if (signal?.aborted) throw new GenerationPausedError();
     try {
-      return await aiAskJson<T>(prompt, signal);
+      return await aiAskJson<T>(prompt, signal, fast);
     } catch (e) {
       if (e instanceof GenerationPausedError || signal?.aborted) {
         throw new GenerationPausedError();
@@ -102,11 +132,12 @@ async function jx<T = Record<string, unknown>>(
         throw e;
       }
       if (k >= tries) throw e;
+      const delay = k === 1 ? 900 : 2200;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
           signal?.removeEventListener("abort", onAbort);
           resolve();
-        }, 1200 * k);
+        }, delay);
         const onAbort = () => {
           clearTimeout(timer);
           reject(new GenerationPausedError());
@@ -117,6 +148,12 @@ async function jx<T = Record<string, unknown>>(
   }
 }
 
+function extractLessonBody(rec: Record<string, unknown>): string {
+  return String(
+    rec.x ?? rec.content ?? rec.contenido ?? rec.text ?? rec.texto ?? rec.body ?? ""
+  ).trim();
+}
+
 export async function generateAiCourse(
   topic: string,
   sz: string,
@@ -124,7 +161,7 @@ export async function generateAiCourse(
   options?: {
     existingPending?: PendingCourseGen | null;
     signal?: AbortSignal;
-    onProgress?: (i: number, n: number) => void;
+    onProgress?: (i: number, n: number, batchEnd?: number) => void;
     onCheckpoint?: (pending: PendingCourseGen) => void;
   }
 ): Promise<Course> {
@@ -134,11 +171,22 @@ export async function generateAiCourse(
   const rules =
     "texto plano sin formato Markdown; tono cálido y práctico; no inventes estudios, cifras ni citas; si mencionas un texto bíblico, indica su referencia y aclara que es una paráfrasis; no des consejo médico, psicológico clínico ni financiero específico; si el tema toca la salud mental, recomienda apoyo profesional cuando haga falta";
 
+  const validExistingLessons: Record<string, unknown>[] = [];
+  if (existingPending?.completedLessons?.length) {
+    for (const item of existingPending.completedLessons) {
+      if (extractLessonBody(item).length >= 20) {
+        validExistingLessons.push(item);
+      } else {
+        break;
+      }
+    }
+  }
+
   let pending: PendingCourseGen =
     existingPending && existingPending.outline?.lessons?.length
       ? {
           ...existingPending,
-          completedLessons: [...(existingPending.completedLessons || [])],
+          completedLessons: validExistingLessons,
           updatedAt: new Date().toISOString(),
         }
       : {
@@ -150,26 +198,48 @@ export async function generateAiCourse(
         };
 
   if (!existingPending?.outline?.lessons?.length) {
-    onCheckpoint?.(pending);
-    const rawOutline = await jx<PendingCourseOutline>(
+    const rawOutline = await jx<Record<string, unknown>>(
       `Eres un diseñador instruccional de desarrollo personal. Diseña el esquema de un curso en español sobre: ${topic}.${
         base
           ? " Basa el curso en este material existente, amplíalo y profundízalo sin contradecirlo: " + base
           : ""
       } Reglas: ${rules}. El curso tendrá exactamente ${Z.n} lecciones que avancen de lo básico a lo práctico. Responde SOLO con JSON: {"title":string,"area":número (${ar}),"description":string de máximo 30 palabras,"lessons":[{"t":título,"f":qué cubrirá la lección en una frase}],"actions":{"t":título,"items":[5 a 6 acciones concretas y breves]}}`,
-      2,
-      signal
+      3,
+      signal,
+      true
     );
 
-    const ls = (Array.isArray(rawOutline.lessons) ? rawOutline.lessons : []).slice(0, Z.n);
-    if (ls.length < 2) throw new Error("No se pudieron generar las lecciones.");
+    const rawLessons = Array.isArray(rawOutline.lessons)
+      ? rawOutline.lessons
+      : Array.isArray(rawOutline.lecciones)
+        ? rawOutline.lecciones
+        : [];
+    const ls = rawLessons
+      .map((item: unknown) => {
+        const rec = (item || {}) as Record<string, unknown>;
+        return {
+          t: String(rec.t ?? rec.title ?? rec.titulo ?? "").trim(),
+          f: String(rec.f ?? rec.focus ?? rec.enfoque ?? rec.resumen ?? "").trim(),
+        };
+      })
+      .filter((item) => item.t.length > 0)
+      .slice(0, Z.n);
+
+    if (ls.length < 2) {
+      throw new Error("No se pudieron estructurar las lecciones del curso. Inténtalo de nuevo.");
+    }
+
+    const outline: PendingCourseOutline = {
+      title: String(rawOutline.title ?? rawOutline.titulo ?? topic).trim(),
+      area: typeof rawOutline.area === "number" ? rawOutline.area : Number(rawOutline.area) || 7,
+      description: String(rawOutline.description ?? rawOutline.descripcion ?? "").trim(),
+      lessons: ls,
+      actions: rawOutline.actions as { t: string; items: string[] } | undefined,
+    };
 
     pending = {
       ...pending,
-      outline: {
-        ...rawOutline,
-        lessons: ls,
-      },
+      outline,
       completedLessons: [],
       updatedAt: new Date().toISOString(),
     };
@@ -179,29 +249,74 @@ export async function generateAiCourse(
   const outline = pending.outline!;
   const ls = outline.lessons;
   const out: Record<string, unknown>[] = [...pending.completedLessons];
+  const outlineSummary = ls.map((q, j) => `${j + 1}. ${q.t}`).join("; ");
+  const courseTitle = String(outline.title || pending.topic).slice(0, 90);
 
-  for (let i = out.length; i < ls.length; i++) {
+  const generateSingleLesson = async (
+    idx: number,
+    l: { t: string; f: string }
+  ): Promise<Record<string, unknown>> => {
+    const prompt = `Estás escribiendo el curso «${courseTitle}». Esquema: ${outlineSummary}. Escribe ahora la lección ${idx + 1} de ${ls.length}: «${l.t}»${
+      l.f ? ` (${l.f})` : ""
+    }. Reglas: ${rules}. Estructura el texto "x" en 3 o 4 párrafos separados por salto de línea ("\\n"), de ${
+      Z.w
+    } palabras en total, con una explicación clara, un ejemplo concreto, errores comunes y cómo aplicarlo. Incluye además "r" (pregunta de reflexión), "tip" (consejo breve), "ex" ({"t":título,"x":instrucciones paso a paso de un ejercicio}) y, solo si estás seguro de que es real y está bien atribuida, "q" ({"x":cita,"a":autor}); si no, omite "q". Responde SOLO con JSON: {"x":string,"r":string,"tip":string,"ex":{"t":string,"x":string},"q":{"x":string,"a":string}}`;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const raw = await jx<Record<string, unknown>>(prompt, 3, signal, true);
+      const body = extractLessonBody(raw);
+      if (body.length >= 20) {
+        return {
+          ...raw,
+          t: String(raw.t ?? raw.title ?? raw.titulo ?? l.t).trim() || l.t,
+          x: body,
+        };
+      }
+      if (attempt === 2) {
+        throw new Error(`La lección ${idx + 1} llegó vacía. Intenta continuar de nuevo.`);
+      }
+    }
+    throw new Error(`No se pudo completar la lección ${idx + 1}.`);
+  };
+
+  while (out.length < ls.length) {
     if (signal?.aborted) throw new GenerationPausedError();
-    const l = ls[i];
-    onProgress?.(i + 1, ls.length);
-    const x = await jx<Record<string, unknown>>(
-      `Estás escribiendo el curso «${String(outline.title || pending.topic).slice(0, 90)}». Esquema: ${ls
-        .map((q, j) => j + 1 + ". " + q.t)
-        .join("; ")}. Escribe ahora la lección ${i + 1} de ${ls.length}: «${l.t}» (${
-        l.f
-      }). Reglas: ${rules}. Estructura el texto "x" en 3 o 4 párrafos separados por salto de línea ("\\n"), de ${
-        Z.w
-      } palabras en total, con una explicación clara, un ejemplo concreto, errores comunes y cómo aplicarlo. Incluye además "r" (pregunta de reflexión), "tip" (consejo breve), "ex" ({"t":título,"x":instrucciones paso a paso de un ejercicio}) y, solo si estás seguro de que es real y está bien atribuida, "q" ({"x":cita,"a":autor}); si no, omite "q". Responde SOLO con JSON: {"x":string,"r":string,"tip":string,"ex":{"t":string,"x":string},"q":{"x":string,"a":string}}`,
-      2,
-      signal
+    const startIdx = out.length;
+    const batch = ls.slice(startIdx, startIdx + LESSON_BATCH_SIZE);
+    const batchEnd = startIdx + batch.length;
+    onProgress?.(startIdx + 1, ls.length, batchEnd);
+
+    const results = await Promise.allSettled(
+      batch.map((l, offset) => generateSingleLesson(startIdx + offset, l))
     );
-    out.push(Object.assign({ t: l.t }, x));
-    pending = {
-      ...pending,
-      completedLessons: [...out],
-      updatedAt: new Date().toISOString(),
-    };
-    onCheckpoint?.(pending);
+
+    let firstErr: unknown = null;
+    let pushedAny = false;
+    for (const res of results) {
+      if (res.status === "fulfilled") {
+        out.push(res.value);
+        pushedAny = true;
+      } else {
+        firstErr = res.reason;
+        break;
+      }
+    }
+
+    if (pushedAny) {
+      pending = {
+        ...pending,
+        completedLessons: [...out],
+        updatedAt: new Date().toISOString(),
+      };
+      onCheckpoint?.(pending);
+    }
+
+    if (firstErr) {
+      if (signal?.aborted || firstErr instanceof GenerationPausedError) {
+        throw new GenerationPausedError();
+      }
+      throw firstErr;
+    }
   }
 
   return cleanCourse({

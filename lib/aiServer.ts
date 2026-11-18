@@ -2,10 +2,15 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 export const AI_MODEL = "gemini-4-hydrogen";
+export const FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const MAX_PROMPT_CHARS = 16000;
-const AI_TIMEOUT_MS = 45000;
+const PRIMARY_TIMEOUT_MS = 14_000;
+const FALLBACK_TIMEOUT_MS = 25_000;
+const PRIMARY_COOLDOWN_MS = 120_000;
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_REQUESTS = 30;
+const RATE_MAX_REQUESTS = 60;
+
+let primaryUnhealthyUntil = 0;
 
 const SYSTEM_GUARDRAIL =
   "Eres el asistente de Rumbo en español. Mantén un tono cálido, respetuoso y práctico. " +
@@ -71,8 +76,31 @@ function getClient(): GoogleGenAI | null {
   });
 }
 
+function extractReadableError(raw: unknown): string {
+  const str = String(raw || "").trim();
+  if (!str) return "Error al consultar Gemini.";
+  if (str.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(str) as { error?: { message?: string; code?: number } };
+      if (parsed?.error?.message) {
+        return parsed.error.message;
+      }
+    } catch {
+      // ignore JSON parse failure
+    }
+  }
+  return str;
+}
+
 function sanitizeErrorMessage(raw: unknown): string {
-  const msg = String(raw || "Error al consultar Gemini.")
+  const extracted = extractReadableError(raw);
+  if (/high demand|UNAVAILABLE|503/i.test(extracted)) {
+    return "El servicio de IA está con alta demanda temporalmente. Inténtalo de nuevo en unos segundos.";
+  }
+  if (/RESOURCE_EXHAUSTED|429|quota/i.test(extracted)) {
+    return "Se alcanzó el límite temporal de solicitudes de IA. Espera unos segundos e inténtalo de nuevo.";
+  }
+  const msg = extracted
     .replace(/AIza[0-9A-Za-z_-]{16,}/g, "[clave-oculta]")
     .replace(/Bearer\s+\S+/gi, "Bearer [oculto]")
     .replace(/(api[_-]?key|token|secret)\s*[:=]\s*\S+/gi, "$1=[oculto]")
@@ -185,16 +213,87 @@ async function readJsonBody(req: ApiRequestLike): Promise<Record<string, unknown
 }
 
 function parseJsonResponse(raw: string): unknown {
-  const cleaned = raw.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+  const cleaned = raw.replace(/^```(?:json)?\s*|\s*```$/gi, "").trim();
   try {
     return JSON.parse(cleaned);
   } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(cleaned.slice(start, end + 1));
+    const objStart = cleaned.indexOf("{");
+    const objEnd = cleaned.lastIndexOf("}");
+    if (objStart >= 0 && objEnd > objStart) {
+      try {
+        return JSON.parse(cleaned.slice(objStart, objEnd + 1));
+      } catch {
+        // continue
+      }
+    }
+    const arrStart = cleaned.indexOf("[");
+    const arrEnd = cleaned.lastIndexOf("]");
+    if (arrStart >= 0 && arrEnd > arrStart) {
+      return JSON.parse(cleaned.slice(arrStart, arrEnd + 1));
     }
     throw new Error("La respuesta de la IA no tuvo formato JSON válido.");
+  }
+}
+
+function isRetryableModelError(err: unknown): boolean {
+  const e = err as { status?: number; code?: number; message?: string };
+  const status = Number(e?.status || e?.code || 0);
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+  const msg = String(e?.message || "");
+  return /high demand|UNAVAILABLE|RESOURCE_EXHAUSTED|Tiempo de espera|503|429|timeout|EMPTY_RESPONSE|formato JSON válido/i.test(
+    msg
+  );
+}
+
+async function callGeminiModel(
+  ai: GoogleGenAI,
+  model: string,
+  prompt: string,
+  wantJson: boolean,
+  timeoutMs: number
+): Promise<{ text: string; data?: unknown }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        Object.assign(new Error("Tiempo de espera agotado al consultar la IA."), {
+          status: 504,
+        })
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    const thinkingLevel =
+      model === FALLBACK_MODEL ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction: SYSTEM_GUARDRAIL,
+          thinkingConfig: { thinkingLevel },
+          ...(wantJson ? { responseMimeType: "application/json" } : {}),
+        },
+      }),
+      timeoutPromise,
+    ]);
+
+    const text = (response.text ?? "").trim();
+    if (!text) {
+      throw Object.assign(new Error("EMPTY_RESPONSE: Gemini no devolvió texto."), {
+        status: 502,
+      });
+    }
+    if (wantJson) {
+      const data = parseJsonResponse(text);
+      return { text, data };
+    }
+    return { text };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -267,7 +366,7 @@ export async function handleAiGenerate(
     return;
   }
 
-  const { prompt, json } = body;
+  const { prompt, json, fast } = body;
   if (typeof prompt !== "string" || !prompt.trim()) {
     sendJson(res, 400, { error: "INVALID_PROMPT", message: "Prompt vacío." });
     return;
@@ -283,49 +382,53 @@ export async function handleAiGenerate(
   }
 
   const wantJson = Boolean(json);
+  const preferFast = Boolean(fast) || Date.now() < primaryUnhealthyUntil;
+  const attempts: { model: string; timeoutMs: number }[] = preferFast
+    ? [
+        { model: FALLBACK_MODEL, timeoutMs: FALLBACK_TIMEOUT_MS },
+        { model: AI_MODEL, timeoutMs: PRIMARY_TIMEOUT_MS },
+      ]
+    : [
+        { model: AI_MODEL, timeoutMs: PRIMARY_TIMEOUT_MS },
+        { model: FALLBACK_MODEL, timeoutMs: FALLBACK_TIMEOUT_MS },
+      ];
 
-  try {
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(Object.assign(new Error("Tiempo de espera agotado al consultar la IA."), { status: 504 }));
-      }, AI_TIMEOUT_MS);
-    });
-
-    const response = await Promise.race([
-      ai.models.generateContent({
-        model: AI_MODEL,
-        contents: cleanPrompt,
-        config: {
-          systemInstruction: SYSTEM_GUARDRAIL,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          ...(wantJson ? { responseMimeType: "application/json" } : {}),
-        },
-      }),
-      timeoutPromise,
-    ]);
-
-    const text = (response.text ?? "").trim();
-    if (!text) {
-      sendJson(res, 502, {
-        error: "EMPTY_RESPONSE",
-        message: "Gemini no devolvió texto.",
-      });
+  let lastErr: unknown;
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    try {
+      const result = await callGeminiModel(
+        ai,
+        attempt.model,
+        cleanPrompt,
+        wantJson,
+        attempt.timeoutMs
+      );
+      if (attempt.model === AI_MODEL) {
+        primaryUnhealthyUntil = 0;
+      }
+      sendJson(
+        res,
+        200,
+        wantJson ? { text: result.text, data: result.data } : { text: result.text }
+      );
       return;
+    } catch (err: unknown) {
+      lastErr = err;
+      if (attempt.model === AI_MODEL && isRetryableModelError(err)) {
+        primaryUnhealthyUntil = Date.now() + PRIMARY_COOLDOWN_MS;
+      }
+      if (!isRetryableModelError(err) || i === attempts.length - 1) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400));
     }
-
-    if (wantJson) {
-      const parsed = parseJsonResponse(text);
-      sendJson(res, 200, { text, data: parsed });
-      return;
-    }
-
-    sendJson(res, 200, { text });
-  } catch (err: unknown) {
-    const e = err as { status?: number; message?: string };
-    const status = typeof e?.status === "number" && e.status >= 400 ? e.status : 500;
-    sendJson(res, status, {
-      error: status === 504 ? "GEMINI_TIMEOUT" : "GEMINI_ERROR",
-      message: sanitizeErrorMessage(e?.message),
-    });
   }
+
+  const e = lastErr as { status?: number; message?: string };
+  const status = typeof e?.status === "number" && e.status >= 400 ? e.status : 500;
+  sendJson(res, status, {
+    error: status === 504 ? "GEMINI_TIMEOUT" : "GEMINI_ERROR",
+    message: sanitizeErrorMessage(e?.message),
+  });
 }

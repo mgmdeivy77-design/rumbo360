@@ -586,11 +586,13 @@ export function autoTopic(S: RumboState): string {
 }
 
 export function cleanCourse(r: Record<string, unknown>): Course {
-  const sx = (v: unknown, n: number) => String(v || "").slice(0, n);
+  const sx = (v: unknown, n: number) => String(v || "").trim().slice(0, n);
   const rawLessons = Array.isArray(r.lessons) ? r.lessons : [];
   const L = rawLessons
     .slice(0, 10)
     .map((x: Record<string, unknown>) => {
+      const title = sx(x.t ?? x.title ?? x.titulo, 90);
+      const body = sx(x.x ?? x.content ?? x.contenido ?? x.text ?? x.texto ?? x.body, 3200);
       const exObj = x.ex as Record<string, unknown> | undefined;
       const qObj = x.q as Record<string, unknown> | undefined;
       const extra: LessonExtra = {
@@ -599,10 +601,12 @@ export function cleanCourse(r: Record<string, unknown>): Course {
         ex: exObj && exObj.t && exObj.x ? { t: sx(exObj.t, 90), x: sx(exObj.x, 700) } : null,
         q: qObj && qObj.x ? { x: sx(qObj.x, 220), a: sx(qObj.a, 60) || "Desconocido" } : null,
       };
-      return [sx(x.t, 90), sx(x.x, 3200), extra] as [string, string, LessonExtra];
+      return [title, body, extra] as [string, string, LessonExtra];
     })
     .filter((x) => x[0] && x[1]);
-  if (L.length < 2) throw new Error("FEW_LESSONS");
+  if (L.length < 2) {
+    throw new Error("No se pudieron estructurar suficientes lecciones válidas. Intenta generar de nuevo.");
+  }
   const a = Math.min(8, Math.max(0, Math.round(Number(r.area)) || 7));
   const rawActions = r.actions as { t?: unknown; items?: unknown[] } | undefined;
   const ai =
