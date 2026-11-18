@@ -2,7 +2,7 @@ import {
   handleAiStatus,
   type ApiRequestLike,
   type ApiResponseLike,
-} from "../../lib/aiServer.ts";
+} from "../../lib/aiServer.js";
 
 export default async function handler(
   req: ApiRequestLike,
